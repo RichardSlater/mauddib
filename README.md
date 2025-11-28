@@ -85,7 +85,7 @@ Create a `.env` file that is **not committed to version control**:
 touch ~/.muaddib.env
 chmod 600 ~/.muaddib.env
 
-# Add your token with the format source GITHUB_TOKEN=github_pat_xxxx
+# Add your token with the format export GITHUB_TOKEN=github_pat_xxxx
 vi ~/.muaddib.env
 ```
 
