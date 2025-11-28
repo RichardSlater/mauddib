@@ -103,6 +103,109 @@ func ParseCSVForTest(r io.Reader) (*VulnDB, error) {
 	return parseCSV(r)
 }
 
+// csvColumnIndices holds the detected column indices for CSV parsing
+type csvColumnIndices struct {
+	nameIdx      int
+	versionIdx   int
+	usedFallback bool
+}
+
+// detectColumnIndices finds the column indices for package name and version
+func detectColumnIndices(header []string) csvColumnIndices {
+	indices := csvColumnIndices{nameIdx: -1, versionIdx: -1}
+
+	for i, col := range header {
+		colLower := strings.ToLower(strings.TrimSpace(col))
+		if colLower == "package_name" || colLower == "packagename" || colLower == "name" || colLower == "package" {
+			indices.nameIdx = i
+		}
+		if colLower == "package_versions" || colLower == "package_version" || colLower == "packageversion" || colLower == "version" || colLower == "versions" {
+			indices.versionIdx = i
+		}
+	}
+
+	// Fall back to positional parsing if headers not recognized
+	if indices.nameIdx == -1 {
+		indices.nameIdx = 0
+		indices.usedFallback = true
+	}
+	if indices.versionIdx == -1 {
+		indices.versionIdx = 1
+		indices.usedFallback = true
+	}
+
+	return indices
+}
+
+// readAllRecords reads all records from the CSV reader, skipping malformed lines
+func readAllRecords(reader *csv.Reader) [][]string {
+	var records [][]string
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			continue // Skip malformed lines
+		}
+		records = append(records, record)
+	}
+	return records
+}
+
+// warnFallbackParsing issues a warning when fallback parsing is used
+func warnFallbackParsing(header []string, records [][]string, indices csvColumnIndices) {
+	if !indices.usedFallback || len(records) == 0 {
+		return
+	}
+
+	sampleCount := 3
+	if len(records) < sampleCount {
+		sampleCount = len(records)
+	}
+
+	var samples []string
+	for i := 0; i < sampleCount; i++ {
+		rec := records[i]
+		if len(rec) > 1 {
+			samples = append(samples, fmt.Sprintf("  %s @ %s", rec[indices.nameIdx], rec[indices.versionIdx]))
+		}
+	}
+
+	warn("CSV headers not recognized (found: %v). Assuming column 1 = package name, column 2 = version. Sample data:\n%s",
+		header, strings.Join(samples, "\n"))
+}
+
+// processRecord processes a single CSV record and adds entries to the database
+func processRecord(db *VulnDB, record []string, indices csvColumnIndices) {
+	if indices.nameIdx >= len(record) {
+		return
+	}
+
+	packageName := strings.TrimSpace(record[indices.nameIdx])
+	if packageName == "" {
+		return
+	}
+
+	versionField := ""
+	if indices.versionIdx >= 0 && indices.versionIdx < len(record) {
+		versionField = strings.TrimSpace(record[indices.versionIdx])
+	}
+
+	if versionField == "" {
+		return // Skip entries without version
+	}
+
+	versions := parseVersionList(versionField)
+	for _, version := range versions {
+		db.Add(&VulnEntry{
+			PackageName:     packageName,
+			PackageVersion:  version,
+			OriginalVersion: versionField,
+		})
+	}
+}
+
 // parseCSV parses a CSV file looking for package_name and package_version columns
 // Handles comma-separated version lists like "6.10.1, 6.8.2, 6.8.3"
 // If column headers are not recognized, falls back to positional parsing (first=name, second=version)
@@ -110,7 +213,6 @@ func parseCSV(r io.Reader) (*VulnDB, error) {
 	db := NewVulnDB()
 	reader := csv.NewReader(r)
 
-	// Read header
 	header, err := reader.Read()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read CSV header: %w", err)
@@ -120,100 +222,12 @@ func parseCSV(r io.Reader) (*VulnDB, error) {
 		return nil, fmt.Errorf("CSV must have at least 2 columns (package name and version)")
 	}
 
-	// Find column indices by trying to match known column names
-	nameIdx := -1
-	versionIdx := -1
-	for i, col := range header {
-		colLower := strings.ToLower(strings.TrimSpace(col))
-		// Support various column naming conventions:
-		// - DataDog format: package_name, package_versions
-		// - Wiz format: Package, Version
-		// - Generic: name, version
-		if colLower == "package_name" || colLower == "packagename" || colLower == "name" || colLower == "package" {
-			nameIdx = i
-		}
-		if colLower == "package_versions" || colLower == "package_version" || colLower == "packageversion" || colLower == "version" || colLower == "versions" {
-			versionIdx = i
-		}
-	}
+	indices := detectColumnIndices(header)
+	allRecords := readAllRecords(reader)
+	warnFallbackParsing(header, allRecords, indices)
 
-	// Fall back to positional parsing if headers not recognized
-	usedFallback := false
-	if nameIdx == -1 {
-		nameIdx = 0
-		usedFallback = true
-	}
-	if versionIdx == -1 {
-		versionIdx = 1
-		usedFallback = true
-	}
-
-	// Read a few records to provide sample data for warning
-	var allRecords [][]string
-	for {
-		record, err := reader.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			// Skip malformed lines
-			continue
-		}
-		allRecords = append(allRecords, record)
-	}
-
-	// Issue warning with sample data if we used fallback
-	if usedFallback && len(allRecords) > 0 {
-		sampleCount := 3
-		if len(allRecords) < sampleCount {
-			sampleCount = len(allRecords)
-		}
-
-		var samples []string
-		for i := 0; i < sampleCount; i++ {
-			rec := allRecords[i]
-			if len(rec) > 1 {
-				samples = append(samples, fmt.Sprintf("  %s @ %s", rec[nameIdx], rec[versionIdx]))
-			}
-		}
-
-		warn("CSV headers not recognized (found: %v). Assuming column 1 = package name, column 2 = version. Sample data:\n%s",
-			header, strings.Join(samples, "\n"))
-	}
-
-	// Process all records
 	for _, record := range allRecords {
-		if nameIdx >= len(record) {
-			continue
-		}
-
-		packageName := strings.TrimSpace(record[nameIdx])
-		if packageName == "" {
-			continue
-		}
-
-		// Get version field
-		versionField := ""
-		if versionIdx >= 0 && versionIdx < len(record) {
-			versionField = strings.TrimSpace(record[versionIdx])
-		}
-
-		if versionField == "" {
-			// Skip entries without version - we require both name AND version
-			continue
-		}
-
-		// Handle comma-separated versions like "6.10.1, 6.8.2, 6.8.3, 6.9.1"
-		versions := parseVersionList(versionField)
-
-		for _, version := range versions {
-			entry := &VulnEntry{
-				PackageName:     packageName,
-				PackageVersion:  version,
-				OriginalVersion: versionField,
-			}
-			db.Add(entry)
-		}
+		processRecord(db, record, indices)
 	}
 
 	return db, nil

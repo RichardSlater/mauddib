@@ -24,6 +24,25 @@ type WorkflowFile struct {
 	RepoName string
 }
 
+// isPackageFile checks if a filename is a package manifest file
+func isPackageFile(filename string) bool {
+	return filename == "package.json" || filename == "package-lock.json"
+}
+
+// findPackageFilePaths extracts package file paths from a git tree
+func findPackageFilePaths(tree *github.Tree) []string {
+	var paths []string
+	for _, entry := range tree.Entries {
+		if entry.Type == nil || *entry.Type != "blob" || entry.Path == nil {
+			continue
+		}
+		if isPackageFile(path.Base(*entry.Path)) {
+			paths = append(paths, *entry.Path)
+		}
+	}
+	return paths
+}
+
 // FindPackageFiles finds all package.json and package-lock.json files in a repository
 func (c *Client) FindPackageFiles(ctx context.Context, repo *Repository) ([]*PackageFile, error) {
 	if err := c.wait(ctx); err != nil {
@@ -32,10 +51,8 @@ func (c *Client) FindPackageFiles(ctx context.Context, repo *Repository) ([]*Pac
 
 	c.progress("🔍 Scanning %s for package files...", repo.FullName)
 
-	// Get the tree recursively
 	tree, resp, err := c.client.Git.GetTree(ctx, repo.Owner, repo.Name, repo.DefaultBranch, true)
 	if err != nil {
-		// Check if it's a 409 conflict (empty repo) or 404 (no default branch)
 		if resp != nil && (resp.StatusCode == 409 || resp.StatusCode == 404) {
 			c.progress("⚠️  Skipping %s (empty or no default branch)", repo.FullName)
 			return nil, nil
@@ -44,22 +61,7 @@ func (c *Client) FindPackageFiles(ctx context.Context, repo *Repository) ([]*Pac
 	}
 	c.handleRateLimit(resp)
 
-	// Find package files
-	var packageFilePaths []string
-	for _, entry := range tree.Entries {
-		if entry.Type == nil || *entry.Type != "blob" {
-			continue
-		}
-		if entry.Path == nil {
-			continue
-		}
-
-		filename := path.Base(*entry.Path)
-		if filename == "package.json" || filename == "package-lock.json" {
-			packageFilePaths = append(packageFilePaths, *entry.Path)
-		}
-	}
-
+	packageFilePaths := findPackageFilePaths(tree)
 	if len(packageFilePaths) == 0 {
 		c.progress("📭 No package files found in %s", repo.FullName)
 		return nil, nil
@@ -67,9 +69,13 @@ func (c *Client) FindPackageFiles(ctx context.Context, repo *Repository) ([]*Pac
 
 	c.progress("📦 Found %d package file(s) in %s", len(packageFilePaths), repo.FullName)
 
-	// Fetch content for each file
+	return c.fetchPackageFileContents(ctx, repo, packageFilePaths)
+}
+
+// fetchPackageFileContents fetches content for multiple package files
+func (c *Client) fetchPackageFileContents(ctx context.Context, repo *Repository, paths []string) ([]*PackageFile, error) {
 	var files []*PackageFile
-	for _, filePath := range packageFilePaths {
+	for _, filePath := range paths {
 		if err := c.wait(ctx); err != nil {
 			return nil, fmt.Errorf("rate limit wait: %w", err)
 		}
@@ -86,7 +92,6 @@ func (c *Client) FindPackageFiles(ctx context.Context, repo *Repository) ([]*Pac
 			RepoName: repo.FullName,
 		})
 	}
-
 	return files, nil
 }
 

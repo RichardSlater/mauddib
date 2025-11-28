@@ -57,23 +57,21 @@ Example:
 	}
 }
 
-func run(cmd *cobra.Command, args []string) error {
-	rep := reporter.NewTerminalReporter(reporter.WithVerbose(verbose))
-	rep.PrintBanner()
-
-	// Validate flags
+// validateFlags checks that exactly one of --org or --user is specified
+func validateFlags() error {
 	if org == "" && user == "" {
 		return fmt.Errorf("either --org or --user must be specified")
 	}
 	if org != "" && user != "" {
 		return fmt.Errorf("--org and --user are mutually exclusive")
 	}
+	return nil
+}
 
-	// Setup context with cancellation
+// setupContext creates a context with cancellation and signal handling
+func setupContext(rep *reporter.TerminalReporter) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
-	// Handle interrupt
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -82,80 +80,58 @@ func run(cmd *cobra.Command, args []string) error {
 		cancel()
 	}()
 
-	// Load vulnerability database
+	return ctx, cancel
+}
+
+// loadVulnDB loads the vulnerability database from the configured source
+func loadVulnDB(rep *reporter.TerminalReporter) (*vuln.VulnDB, error) {
 	rep.ReportInfo("📥 Loading vulnerability database...")
 
-	// Set up warning handler for CSV parsing
 	vuln.SetWarningFunc(func(msg string) {
 		rep.ReportWarning("⚠️  %s", msg)
 	})
 
-	var db *vuln.VulnDB
-	var err error
-
 	if vulnCSV != "" {
-		// Custom source provided - load single source
-		vulnSource := vulnCSV
-		rep.ReportInfo("   Using custom source: %s", vulnSource)
-
-		if strings.HasPrefix(vulnSource, "http://") || strings.HasPrefix(vulnSource, "https://") {
-			db, err = vuln.LoadFromURL(vulnSource)
-		} else {
-			db, err = vuln.LoadFromFile(vulnSource)
+		rep.ReportInfo("   Using custom source: %s", vulnCSV)
+		if strings.HasPrefix(vulnCSV, "http://") || strings.HasPrefix(vulnCSV, "https://") {
+			return vuln.LoadFromURL(vulnCSV)
 		}
-	} else {
-		// No custom source - load both default sources (DataDog and Wiz)
-		rep.ReportInfo("   Using default sources: DataDog + Wiz IOC lists")
-		db, err = vuln.LoadFromMultipleURLs(vuln.DefaultIOCURLs())
+		return vuln.LoadFromFile(vulnCSV)
 	}
 
-	if err != nil {
-		return fmt.Errorf("failed to load vulnerability database: %w", err)
-	}
+	rep.ReportInfo("   Using default sources: DataDog + Wiz IOC lists")
+	return vuln.LoadFromMultipleURLs(vuln.DefaultIOCURLs())
+}
 
-	rep.ReportSuccess("Loaded %d IOC entries (%d unique packages, %d vulnerable versions)", db.TotalEntries(), db.UniquePackages(), db.Size())
-
-	// Create GitHub client
+// createGitHubClient creates and configures the GitHub API client
+func createGitHubClient(rep *reporter.TerminalReporter) (*github.Client, error) {
 	progressCb := func(msg string) {
 		if verbose {
 			rep.ReportProgress(msg)
 		}
 	}
 
-	ghClient, err := github.NewClientFromEnv(
+	return github.NewClientFromEnv(
 		github.WithRateLimit(rateLimit),
 		github.WithProgressCallback(progressCb),
 	)
-	if err != nil {
-		return err
-	}
+}
 
-	rep.ReportInfo("🔗 Connected to GitHub API (rate limit: %.1f req/sec)", rateLimit)
-
-	// List repositories
-	var repos []*github.Repository
+// listRepositories fetches repositories for the configured org or user
+func listRepositories(ctx context.Context, ghClient *github.Client, rep *reporter.TerminalReporter) ([]*github.Repository, error) {
 	if org != "" {
 		rep.ReportInfo("📦 Fetching repositories for organization: %s", org)
-		repos, err = ghClient.ListOrgRepos(ctx, org)
-	} else {
-		rep.ReportInfo("📦 Fetching repositories for user: %s", user)
-		repos, err = ghClient.ListUserRepos(ctx, user)
+		return ghClient.ListOrgRepos(ctx, org)
 	}
+	rep.ReportInfo("📦 Fetching repositories for user: %s", user)
+	return ghClient.ListUserRepos(ctx, user)
+}
 
-	if err != nil {
-		return fmt.Errorf("failed to list repositories: %w", err)
-	}
-
-	if len(repos) == 0 {
-		rep.ReportInfo("No repositories found")
-		return nil
-	}
-
-	rep.ReportSuccess("Found %d repositories", len(repos))
-
-	// Check for malicious migration repositories
+// checkMaliciousMigrationRepos checks all repos for malicious migration patterns
+func checkMaliciousMigrationRepos(repos []*github.Repository, rep *reporter.TerminalReporter) *scanner.OrgScanResult {
 	rep.ReportInfo("🔍 Checking for malicious migration repositories...")
 	var orgResult scanner.OrgScanResult
+
 	for _, repo := range repos {
 		if github.IsMaliciousMigrationRepo(repo) {
 			orgResult.MaliciousRepos = append(orgResult.MaliciousRepos, &scanner.MaliciousRepo{
@@ -165,17 +141,106 @@ func run(cmd *cobra.Command, args []string) error {
 			rep.ReportMaliciousRepo(repo.FullName, repo.Description)
 		}
 	}
+
 	if len(orgResult.MaliciousRepos) == 0 {
 		rep.ReportSuccess("No malicious migration repositories found")
 	}
+	return &orgResult
+}
 
-	// Create scanner
+// scanRepository scans a single repository for vulnerabilities and malicious patterns
+func scanRepository(
+	ctx context.Context,
+	repo *github.Repository,
+	ghClient *github.Client,
+	scan *scanner.Scanner,
+	rep *reporter.TerminalReporter,
+) *scanner.RepoScanResult {
+	files, err := ghClient.FindPackageFiles(ctx, repo)
+	if err != nil {
+		return &scanner.RepoScanResult{RepoName: repo.FullName, Error: err}
+	}
+
+	result := scan.ScanFiles(files)
+
+	// Check workflows
+	workflows, err := ghClient.FindMaliciousWorkflows(ctx, repo)
+	if err != nil && verbose {
+		rep.ReportProgress(fmt.Sprintf("   ⚠️  Failed to check workflows: %v", err))
+	} else if len(workflows) > 0 {
+		result.MaliciousWorkflows = scan.CheckWorkflows(workflows)
+	}
+
+	// Check branches
+	if verbose {
+		rep.ReportProgress(fmt.Sprintf("🌿 Checking %s for malicious branches...", repo.FullName))
+	}
+	maliciousBranches, err := ghClient.FindMaliciousBranches(ctx, repo)
+	if err != nil && verbose {
+		rep.ReportProgress(fmt.Sprintf("   ⚠️  Failed to check branches: %v", err))
+	} else {
+		if verbose && len(maliciousBranches) == 0 {
+			rep.ReportProgress("   ✓ No malicious branches found")
+		}
+		for _, branch := range maliciousBranches {
+			result.MaliciousBranches = append(result.MaliciousBranches, &scanner.MaliciousBranch{
+				RepoName:   branch.RepoName,
+				BranchName: branch.Name,
+			})
+		}
+	}
+
+	return result
+}
+
+// resultHasIssues checks if a scan result contains any issues
+func resultHasIssues(result *scanner.RepoScanResult) bool {
+	return len(result.VulnerablePackages) > 0 ||
+		len(result.MaliciousWorkflows) > 0 ||
+		len(result.MaliciousScripts) > 0 ||
+		len(result.MaliciousBranches) > 0
+}
+
+func run(cmd *cobra.Command, args []string) error {
+	rep := reporter.NewTerminalReporter(reporter.WithVerbose(verbose))
+	rep.PrintBanner()
+
+	if err := validateFlags(); err != nil {
+		return err
+	}
+
+	ctx, cancel := setupContext(rep)
+	defer cancel()
+
+	db, err := loadVulnDB(rep)
+	if err != nil {
+		return fmt.Errorf("failed to load vulnerability database: %w", err)
+	}
+	rep.ReportSuccess("Loaded %d IOC entries (%d unique packages, %d vulnerable versions)",
+		db.TotalEntries(), db.UniquePackages(), db.Size())
+
+	ghClient, err := createGitHubClient(rep)
+	if err != nil {
+		return err
+	}
+	rep.ReportInfo("🔗 Connected to GitHub API (rate limit: %.1f req/sec)", rateLimit)
+
+	repos, err := listRepositories(ctx, ghClient, rep)
+	if err != nil {
+		return fmt.Errorf("failed to list repositories: %w", err)
+	}
+
+	if len(repos) == 0 {
+		rep.ReportInfo("No repositories found")
+		return nil
+	}
+	rep.ReportSuccess("Found %d repositories", len(repos))
+
+	orgResult := checkMaliciousMigrationRepos(repos, rep)
 	scan := scanner.NewScanner(db, !skipDev)
 
-	// Scan each repository
 	var results []*scanner.RepoScanResult
 	for i, repo := range repos {
-		// Check for cancellation
 		select {
 		case <-ctx.Done():
 			rep.ReportInfo("Scan interrupted, showing partial results...")
@@ -183,77 +248,22 @@ func run(cmd *cobra.Command, args []string) error {
 		default:
 		}
 
-		// Skip archived repositories
 		if repo.Archived {
 			rep.ReportInfo("🔍 [%d/%d] Scanning %s...", i+1, len(repos), repo.FullName)
 			rep.ReportProgress("   ⏭️  Skipping archived repository")
 			continue
 		}
 
-		// Print repo header before scanning in verbose mode
 		if verbose {
 			rep.ReportRepoStart(repo.FullName)
 		}
 		rep.ReportInfo("🔍 [%d/%d] Scanning %s...", i+1, len(repos), repo.FullName)
 
-		// Find package files
-		files, err := ghClient.FindPackageFiles(ctx, repo)
-		if err != nil {
-			results = append(results, &scanner.RepoScanResult{
-				RepoName: repo.FullName,
-				Error:    err,
-			})
-			continue
-		}
-
-		// Find malicious workflows
-		workflows, err := ghClient.FindMaliciousWorkflows(ctx, repo)
-		if err != nil {
-			// Log error but continue scanning
-			if verbose {
-				rep.ReportProgress(fmt.Sprintf("   ⚠️  Failed to check workflows: %v", err))
-			}
-		}
-
-		// Find malicious branches
-		if verbose {
-			rep.ReportProgress(fmt.Sprintf("🌿 Checking %s for malicious branches...", repo.FullName))
-		}
-		maliciousBranches, err := ghClient.FindMaliciousBranches(ctx, repo)
-		if err != nil {
-			// Log error but continue scanning
-			if verbose {
-				rep.ReportProgress(fmt.Sprintf("   ⚠️  Failed to check branches: %v", err))
-			}
-		} else if verbose && len(maliciousBranches) == 0 {
-			rep.ReportProgress("   ✓ No malicious branches found")
-		}
-
-		// Scan files
-		result := scan.ScanFiles(files)
-
-		// Check workflows for malicious patterns
-		if len(workflows) > 0 {
-			result.MaliciousWorkflows = scan.CheckWorkflows(workflows)
-		}
-
-		// Add malicious branches to result
-		for _, branch := range maliciousBranches {
-			result.MaliciousBranches = append(result.MaliciousBranches, &scanner.MaliciousBranch{
-				RepoName:   branch.RepoName,
-				BranchName: branch.Name,
-			})
-		}
-
+		result := scanRepository(ctx, repo, ghClient, scan, rep)
 		results = append(results, result)
 
-		// Report per-repo if verbose or any issues found
-		hasIssues := len(result.VulnerablePackages) > 0 ||
-			len(result.MaliciousWorkflows) > 0 ||
-			len(result.MaliciousScripts) > 0 ||
-			len(result.MaliciousBranches) > 0
+		hasIssues := resultHasIssues(result)
 		if hasIssues && !verbose {
-			// Print header only if not in verbose mode (verbose already printed it)
 			rep.ReportRepoStart(repo.FullName)
 		}
 		if verbose || hasIssues {
@@ -262,16 +272,8 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 summary:
-	// Print summary
-	rep.ReportSummary(results, &orgResult, db.Size())
+	rep.ReportSummary(results, orgResult, db.Size())
 	rep.ReportInfo("📊 Total API requests made: %d", ghClient.GetRequestsMade())
-
-	// Exit with error code if vulnerabilities or malicious workflows found
-	for _, result := range results {
-		if len(result.VulnerablePackages) > 0 || len(result.MaliciousWorkflows) > 0 {
-			return nil // Return nil but could return error to indicate vulns found
-		}
-	}
 
 	return nil
 }

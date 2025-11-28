@@ -29,3 +29,9 @@ repos:
         language: system
         pass_filenames: false
         types: [go]
+      - id: gocyclo
+        name: gocyclo (cyclomatic complexity)
+        entry: bash -c 'go install github.com/fzipp/gocyclo/cmd/gocyclo@latest && gocyclo -over 15 .'
+        language: system
+        pass_filenames: false
+        types: [go]
