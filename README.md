@@ -5,12 +5,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Release](https://img.shields.io/github/v/release/RichardSlater/muaddib)](https://github.com/RichardSlater/muaddib/releases/latest)
 
-Shai-Hallud NPM Worm scanner for GitHub repositories. Scans organization or user repositories for vulnerable npm packages by checking `package.json` and `package-lock.json` files against an IOC (Indicators of Compromise) database.
+Shai-Hallud NPM Worm scanner for GitHub repositories. Scans organization or user repositories for vulnerable npm packages by checking package manifests and lock files against an IOC (Indicators of Compromise) database.
 
 ## Features
 
 - 🔍 Scans all repositories in a GitHub organization or user account
-- 📦 Parses both `package.json` and `package-lock.json` files
+- 📦 Supports multiple package managers and lock files:
+  - npm: `package.json`, `package-lock.json`, `npm-shrinkwrap.json`
+  - Yarn: `yarn.lock` (v1 classic format)
+  - pnpm: `pnpm-lock.yaml` (v6+ format)
 - 🌳 Enumerates all dependencies including transitive (nested) dependencies
 - 🛡️ Checks against multiple vulnerability databases (DataDog + Wiz IOC lists by default)
 - 🚨 Detects malicious migration repositories (`*-migration` with "Shai-Hulud Migration" description)

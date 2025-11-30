@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Package represents a package with name and version
@@ -228,4 +230,234 @@ func cleanVersion(version string) string {
 	}
 
 	return version
+}
+
+// PnpmLockYAML represents the structure of a pnpm-lock.yaml file (v6+)
+type PnpmLockYAML struct {
+	LockfileVersion string                    `yaml:"lockfileVersion"`
+	Packages        map[string]PnpmLockEntry  `yaml:"packages"`
+	Dependencies    map[string]interface{}    `yaml:"dependencies"`    // Optional, for reference
+	DevDependencies map[string]interface{}    `yaml:"devDependencies"` // Optional, for reference
+}
+
+// PnpmLockEntry represents an entry in the pnpm packages map
+type PnpmLockEntry struct {
+	Version      string            `yaml:"version"`
+	Resolution   map[string]string `yaml:"resolution"`
+	Dev          bool              `yaml:"dev"`
+	Optional     bool              `yaml:"optional"`
+	Dependencies map[string]string `yaml:"dependencies"`
+}
+
+// ParsePnpmLock parses a pnpm-lock.yaml file and returns the list of packages
+func ParsePnpmLock(content string, includeDev bool) ([]*Package, error) {
+	var lockFile PnpmLockYAML
+	if err := yaml.Unmarshal([]byte(content), &lockFile); err != nil {
+		return nil, fmt.Errorf("failed to parse pnpm-lock.yaml: %w", err)
+	}
+
+	var packages []*Package
+	seen := make(map[string]bool)
+
+	// Parse the packages map
+	// Keys are in format: /pkg/1.0.0 or /@scope/pkg@1.0.0 or /pkg@1.0.0
+	for key, entry := range lockFile.Packages {
+		// Skip root package (empty key)
+		if key == "" {
+			continue
+		}
+
+		// Skip dev dependencies if requested
+		if entry.Dev && !includeDev {
+			continue
+		}
+
+		// Extract package name and version from key
+		name, version := parsePnpmPackageKey(key)
+		if name == "" || version == "" {
+			continue
+		}
+
+		// Deduplicate
+		pkgKey := name + "@" + version
+		if seen[pkgKey] {
+			continue
+		}
+		seen[pkgKey] = true
+
+		packages = append(packages, &Package{
+			Name:    name,
+			Version: version,
+			IsDev:   entry.Dev,
+			Source:  "transitive",
+		})
+	}
+
+	return packages, nil
+}
+
+// parsePnpmPackageKey extracts package name and version from a pnpm package key
+// Examples:
+//   /pkg/1.0.0 -> (pkg, 1.0.0)
+//   /@scope/pkg@1.0.0 -> (@scope/pkg, 1.0.0)
+//   /pkg@1.0.0 -> (pkg, 1.0.0)
+//   /@scope/pkg/1.0.0 -> (@scope/pkg, 1.0.0)
+func parsePnpmPackageKey(key string) (name, version string) {
+	// Remove leading slash
+	key = strings.TrimPrefix(key, "/")
+
+	// Handle scoped packages
+	if strings.HasPrefix(key, "@") {
+		// Find the @ that separates name from version
+		// Format: @scope/pkg@version or @scope/pkg/version
+		parts := strings.SplitN(key, "@", 3) // Split into ["", "scope/pkg", "version"] or ["", "scope/pkg/version"]
+		if len(parts) < 2 {
+			return "", ""
+		}
+
+		scopedName := "@" + parts[1]
+
+		// Check if version is after @ or /
+		if len(parts) == 3 {
+			// Format: @scope/pkg@version
+			return scopedName, parts[2]
+		}
+
+		// Format: @scope/pkg/version - split on last /
+		if idx := strings.LastIndex(scopedName, "/"); idx > 0 {
+			return scopedName[:idx], scopedName[idx+1:]
+		}
+
+		return "", ""
+	}
+
+	// Regular package: pkg@version or pkg/version
+	if strings.Contains(key, "@") {
+		parts := strings.SplitN(key, "@", 2)
+		if len(parts) == 2 {
+			return parts[0], parts[1]
+		}
+	}
+
+	// Format: pkg/version
+	if idx := strings.LastIndex(key, "/"); idx > 0 {
+		return key[:idx], key[idx+1:]
+	}
+
+	return "", ""
+}
+
+// ParseYarnLock parses a yarn.lock v1 file and returns the list of packages
+func ParseYarnLock(content string, includeDev bool) ([]*Package, error) {
+	var packages []*Package
+	seen := make(map[string]bool)
+
+	lines := strings.Split(content, "\n")
+	var currentNames []string
+	var currentVersion string
+	inEntry := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Skip comments and empty lines
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		// Check if this is a package declaration line (starts with package name)
+		// Format: "pkg@^1.0.0", "pkg@~2.0.0":
+		if !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") && strings.HasSuffix(trimmed, ":") {
+			// Save previous entry if exists
+			if inEntry && currentVersion != "" && len(currentNames) > 0 {
+				for _, name := range currentNames {
+					pkgKey := name + "@" + currentVersion
+					if !seen[pkgKey] {
+						seen[pkgKey] = true
+						packages = append(packages, &Package{
+							Name:    name,
+							Version: currentVersion,
+							IsDev:   false, // yarn.lock v1 doesn't track dev vs prod
+							Source:  "transitive",
+						})
+					}
+				}
+			}
+
+			// Parse new package names (can be multiple)
+			// Remove trailing colon
+			namesStr := strings.TrimSuffix(trimmed, ":")
+			// Split by comma for multiple ranges
+			nameRanges := strings.Split(namesStr, ",")
+			currentNames = []string{}
+			for _, nr := range nameRanges {
+				nr = strings.TrimSpace(nr)
+				// Remove quotes
+				nr = strings.Trim(nr, "\"'")
+				// Extract package name (before @)
+				name := extractYarnPackageName(nr)
+				if name != "" {
+					currentNames = append(currentNames, name)
+				}
+			}
+			currentVersion = ""
+			inEntry = true
+			continue
+		}
+
+		// Parse version field
+		if inEntry && strings.HasPrefix(trimmed, "version") {
+			parts := strings.SplitN(trimmed, " ", 2)
+			if len(parts) == 2 {
+				version := strings.Trim(parts[1], "\"'")
+				currentVersion = version
+			}
+		}
+	}
+
+	// Save last entry
+	if inEntry && currentVersion != "" && len(currentNames) > 0 {
+		for _, name := range currentNames {
+			pkgKey := name + "@" + currentVersion
+			if !seen[pkgKey] {
+				seen[pkgKey] = true
+				packages = append(packages, &Package{
+					Name:    name,
+					Version: currentVersion,
+					IsDev:   false,
+					Source:  "transitive",
+				})
+			}
+		}
+	}
+
+	return packages, nil
+}
+
+// extractYarnPackageName extracts the package name from a yarn.lock entry
+// Examples:
+//   "pkg@^1.0.0" -> pkg
+//   "@scope/pkg@^1.0.0" -> @scope/pkg
+//   "pkg@npm:other@1.0.0" -> pkg
+func extractYarnPackageName(entry string) string {
+	// Handle npm: aliases
+	if strings.Contains(entry, "@npm:") {
+		parts := strings.SplitN(entry, "@npm:", 2)
+		entry = parts[0]
+	}
+
+	// Handle scoped packages
+	if strings.HasPrefix(entry, "@") {
+		// Find the second @ which separates name from version
+		idx := strings.Index(entry[1:], "@")
+		if idx > 0 {
+			return entry[:idx+1]
+		}
+		// No version specified, return as-is
+		return entry
+	}
+
+	// Regular package
+	parts := strings.SplitN(entry, "@", 2)
+	return parts[0]
 }

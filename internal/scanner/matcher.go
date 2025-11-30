@@ -129,8 +129,12 @@ func (s *Scanner) parseFile(file *github.PackageFile) ([]*Package, error) {
 	switch filename {
 	case "package.json":
 		return ParsePackageJSON(file.Content, s.includeDev)
-	case "package-lock.json":
+	case "package-lock.json", "npm-shrinkwrap.json":
 		return ParsePackageLock(file.Content, s.includeDev)
+	case "yarn.lock":
+		return ParseYarnLock(file.Content, s.includeDev)
+	case "pnpm-lock.yaml":
+		return ParsePnpmLock(file.Content, s.includeDev)
 	default:
 		return nil, nil
 	}
