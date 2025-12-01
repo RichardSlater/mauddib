@@ -2,7 +2,17 @@
 
 ## Project Overview
 
-Muaddib is a Go CLI tool that scans GitHub organizations/users for npm packages affected by the Shai-Hulud supply chain attack. It fetches `package.json` and `package-lock.json` files via the GitHub API and matches dependencies against an IOC (Indicators of Compromise) database. It also detects malicious GitHub Actions workflows created by the worm.
+Muaddib is a Go CLI tool that scans GitHub organizations/users for npm packages affected by the Shai-Hulud supply chain attack. It fetches package manifest and lock files via the GitHub API and matches dependencies against an IOC (Indicators of Compromise) database. It also detects malicious GitHub Actions workflows created by the worm.
+
+## Important Considerations
+
+- Under no circumstances should you disable GPG signing, as it is critical for maintaining the security and integrity of the codebase. This means that all commits should have `-S` specified, if signing fails stop and inform the user who will be able to fix it.
+
+## Supported Package Managers
+
+- **npm**: `package.json`, `package-lock.json`, `npm-shrinkwrap.json`
+- **Yarn Classic (v1)**: `yarn.lock` (Yarn Berry/v2+ is detected and returns an error)
+- **pnpm**: `pnpm-lock.yaml` (v6+ and v9+ formats supported)
 
 ## Architecture
 
@@ -14,7 +24,7 @@ internal/
 │   ├── repos.go       → List org/user repositories
 │   └── contents.go    → Fetch package files and workflow files via Git tree API
 ├── scanner/           → Core scanning logic
-│   ├── parser.go      → Parse package.json and package-lock.json (v1/v2/v3)
+│   ├── parser.go      → Parse package.json, package-lock.json, yarn.lock, pnpm-lock.yaml
 │   └── matcher.go     → Match packages against VulnDB, detect malicious workflows and scripts
 ├── vuln/              → Vulnerability database
 │   └── loader.go      → Load IOCs from CSV (file or URL), handle version lists
@@ -67,8 +77,19 @@ Use `test-muaddib-*` prefix for fake package names in tests to avoid matching re
 
 Supports multiple lockfile formats in `parser.go`:
 
+**npm (package-lock.json / npm-shrinkwrap.json):**
 - v2/v3: Uses `packages` field with `node_modules/` paths
 - v1 (legacy): Uses nested `dependencies` field with recursive parsing
+
+**pnpm (pnpm-lock.yaml):**
+- v6-v8: Package keys with leading slash (e.g., `/pkg@1.0.0`)
+- v9+: Package keys without leading slash (e.g., `pkg@1.0.0`)
+- Peer dependency suffixes are stripped (e.g., `1.0.0(peer@2.0.0)` → `1.0.0`)
+
+**Yarn (yarn.lock):**
+- Only Yarn Classic (v1) format is supported
+- Yarn Berry (v2+) format is detected and returns an error
+- Note: `--skip-dev` flag has no effect on yarn.lock (format doesn't track dev dependencies)
 
 ## CSV IOC Format (Critical Gotcha)
 

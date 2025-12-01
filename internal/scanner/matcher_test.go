@@ -96,6 +96,48 @@ test-muaddib-vulnerable,1.0.0,"test"`
 	}
 }
 
+func TestScanner_DetectsVulnerablePackageInNpmShrinkwrap(t *testing.T) {
+	// npm-shrinkwrap.json uses the same format as package-lock.json
+	csvData := `package_name,package_versions,sources
+test-muaddib-vulnerable,1.0.0,"test"`
+
+	db, err := vuln.ParseCSVForTest(strings.NewReader(csvData))
+	if err != nil {
+		t.Fatalf("failed to create test DB: %v", err)
+	}
+
+	scanner := NewScanner(db, true)
+
+	files := []*github.PackageFile{
+		{
+			RepoName: "test-repo",
+			Path:     "npm-shrinkwrap.json",
+			Content: `{
+				"name": "test-project",
+				"lockfileVersion": 2,
+				"packages": {
+					"node_modules/test-muaddib-vulnerable": {
+						"version": "1.0.0"
+					},
+					"node_modules/test-muaddib-safe": {
+						"version": "1.0.0"
+					}
+				}
+			}`,
+		},
+	}
+
+	result := scanner.ScanFiles(files)
+
+	if len(result.VulnerablePackages) != 1 {
+		t.Errorf("expected 1 vulnerable package, got %d", len(result.VulnerablePackages))
+	}
+
+	if result.VulnerablePackages[0].Package.Name != "test-muaddib-vulnerable" {
+		t.Errorf("expected test-muaddib-vulnerable, got %s", result.VulnerablePackages[0].Package.Name)
+	}
+}
+
 func TestScanner_DetectsMultipleVulnerableVersions(t *testing.T) {
 	// Test that comma-separated versions are all detected
 	csvData := `package_name,package_versions,sources

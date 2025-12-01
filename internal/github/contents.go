@@ -26,7 +26,12 @@ type WorkflowFile struct {
 
 // isPackageFile checks if a filename is a package manifest file
 func isPackageFile(filename string) bool {
-	return filename == "package.json" || filename == "package-lock.json"
+	switch filename {
+	case "package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml":
+		return true
+	default:
+		return false
+	}
 }
 
 // findPackageFilePaths extracts package file paths from a git tree
